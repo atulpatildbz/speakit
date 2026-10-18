@@ -55,29 +55,55 @@
   .speeds button { border: 0; background: none; color: var(--dim); font: 500 .85rem var(--sans);
                    padding: .45rem .55rem; border-radius: 999px; cursor: pointer; }
   .speeds button[aria-pressed="true"] { color: var(--ink); background: var(--line); }
-  #edit { border: 0; background: none; color: var(--ink); font: 500 .85rem var(--sans); padding: .45rem .7rem;
-          border-radius: 999px; cursor: pointer; border-left: 1px solid var(--line); border-radius: 0 999px 999px 0; }
+  .dockbtn { border: 0; background: none; color: var(--ink); font: 500 .85rem var(--sans); padding: .45rem .7rem;
+             cursor: pointer; border-left: 1px solid var(--line); border-radius: 0 999px 999px 0; }
+  .ghost { font: 500 .85rem var(--sans); color: var(--ink); background: var(--field); border: 1px solid var(--line);
+           border-radius: 8px; padding: .4rem .7rem; cursor: pointer; white-space: nowrap; }
+  .hdr { display: flex; gap: .5rem; align-items: center; min-width: 0; }
+  header h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #chtitle { font: 600 1.7rem/1.3 var(--serif); margin: 0 0 1.5rem; letter-spacing: -.01em; }
+  #drawer { position: fixed; z-index: 20; top: 0; right: 0; bottom: 0; width: min(22rem, 100vw); overflow-y: auto;
+            background: var(--dock); border-left: 1px solid var(--line); padding: 1rem; box-shadow: -8px 0 28px #0000001f; }
+  #drawer .dhead { display: flex; justify-content: space-between; align-items: center; gap: .75rem; margin-bottom: .75rem; }
+  #drawer strong { font-size: .95rem; line-height: 1.3; }
+  #chlist { list-style: none; margin: 0; padding: 0; }
+  #chlist button { display: block; width: 100%; text-align: left; border: 0; background: none; color: var(--ink);
+                   font: 400 .9rem/1.4 var(--sans); padding: .55rem .6rem; border-radius: 8px; cursor: pointer; }
+  #chlist button:hover { background: var(--line); }
+  #chlist button[aria-current="true"] { background: var(--line); font-weight: 600; }
+  #dock { z-index: 10; }
   #hint { max-width: 38rem; margin: 0 auto; padding: 0 1.25rem; font-size: .85rem; color: var(--dim); }
-  @media (max-width: 30rem) { .speeds button { padding: .45rem .35rem; } #edit { padding: .45rem .4rem; } }
+  @media (max-width: 30rem) { .speeds button { padding: .45rem .35rem; } .dockbtn { padding: .45rem .4rem; } }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
 <body>
 <header>
-  <h1>Speakit</h1>
-  <select id="voice" aria-label="Voice"></select>
+  <h1 id="title">Speakit</h1>
+  <div class="hdr">
+    <button id="open" class="ghost">Open EPUB</button>
+    <select id="voice" aria-label="Voice"></select>
+  </div>
+  <input id="file" type="file" accept=".epub,application/epub+zip" hidden>
 </header>
 <div id="hint"></div>
 <main>
   <textarea id="input" placeholder="Paste or type text to read aloud">Paste any text here and press play. Each word lights up as it is spoken. Click any word to start reading from there, and change the speed while it plays.</textarea>
+  <h2 id="chtitle" hidden></h2>
   <div id="reader" hidden><div id="pill"></div></div>
 </main>
 
 <div id="dock">
   <button id="play" aria-label="Play">▶</button>
   <div class="speeds" id="speeds" role="group" aria-label="Speed"></div>
-  <button id="edit" hidden>Edit text</button>
+  <button id="chapters-btn" class="dockbtn" hidden>Chapters</button>
+  <button id="edit" class="dockbtn" hidden>Edit text</button>
 </div>
+
+<aside id="drawer" hidden aria-label="Chapters">
+  <div class="dhead"><strong id="btitle"></strong><button id="closebook" class="ghost">Close book</button></div>
+  <ol id="chlist"></ol>
+</aside>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -120,7 +146,8 @@ let pendingRestart = false;
 // ---- reader rendering ----
 function render() {
   const reader = $('reader');
-  reader.querySelectorAll('.w, .gap').forEach(n => n.remove());
+  reader.replaceChildren($('pill'));
+  $('pill').style.opacity = 0;
   words = []; current = -1;
   for (const m of text.matchAll(/(\S+)|(\s+)/g)) {
     if (m[1]) {
@@ -177,7 +204,10 @@ function speakFrom(offset) {
     if (voice) { u.voice = voice; u.lang = voice.lang; }
     u.rate = rate;
     u.onboundary = e => { if (id === run && e.name === 'word') setCurrent(wordAt(offset + m.index + e.charIndex)); };
-    if (k === chunks.length - 1) u.onend = u.onerror = () => { if (id === run) finish(); };
+    if (k === chunks.length - 1) {
+      u.onend = () => { if (id === run) finish(); };
+      u.onerror = () => { if (id === run) setState('idle'); };   // e.g. autoplay blocked: don't skip ahead
+    }
     synth.speak(u);
   });
   setState('playing');
@@ -189,6 +219,7 @@ function finish() {
   for (const w of words) w.el.classList.remove('read');
   current = -1;
   setState('idle');
+  if (book && chapterIdx + 1 < book.chapters.length) loadChapter(chapterIdx + 1, true);
 }
 
 function setState(s) {
@@ -212,12 +243,162 @@ function toggle() {
   } else speakFrom(0);
 }
 
+// ---- EPUB ----
+let book = null;       // {title, chapters: [{title, text}]}
+let chapterIdx = 0;
+
+// minimal zip reader (central directory + native deflate-raw)
+async function unzip(buf) {
+  const v = new DataView(buf), u8 = new Uint8Array(buf), dec = new TextDecoder();
+  let e = buf.byteLength - 22;
+  while (e >= 0 && v.getUint32(e, true) !== 0x06054b50) e--;
+  if (e < 0) throw new Error('Not a zip file');
+  const count = v.getUint16(e + 10, true);
+  let p = v.getUint32(e + 16, true);
+  const files = new Map();
+  for (let i = 0; i < count; i++) {
+    const n = v.getUint16(p + 28, true), m = v.getUint16(p + 30, true), c = v.getUint16(p + 32, true);
+    const method = v.getUint16(p + 10, true), size = v.getUint32(p + 20, true), off = v.getUint32(p + 42, true);
+    const name = dec.decode(u8.subarray(p + 46, p + 46 + n));
+    files.set(name, async () => {
+      const start = off + 30 + v.getUint16(off + 26, true) + v.getUint16(off + 28, true);
+      const raw = u8.subarray(start, start + size);
+      if (method === 0) return raw;
+      const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    });
+    p += 46 + n + m + c;
+  }
+  return files;
+}
+
+const resolve = (base, rel) => decodeURIComponent(new URL(rel, 'https://x/' + base).pathname.slice(1));
+const BLOCK = /^(p|div|h[1-6]|li|blockquote|section|article|tr|pre|figure|figcaption|dt|dd|header|footer)$/i;
+
+function htmlToText(html) {
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  doc.querySelectorAll('script,style,sup.footnote,.footnote').forEach(n => n.remove());
+  let out = '';
+  (function walk(n) {
+    for (const c of n.childNodes) {
+      if (c.nodeType === 3) out += c.nodeValue.replace(/\s+/g, ' ');
+      else if (c.nodeType === 1) {
+        if (c.tagName === 'BR') out += '\n';
+        walk(c);
+        if (BLOCK.test(c.tagName)) out += '\n\n';
+      }
+    }
+  })(doc.body);
+  return out.replace(/[ \t]*\n[ \t]*/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function parseEpub(file) {
+  const files = await unzip(await file.arrayBuffer());
+  const read = async name => {
+    const f = files.get(name); if (!f) throw new Error('Missing ' + name);
+    return new TextDecoder().decode(await f());
+  };
+  const xml = str => new DOMParser().parseFromString(str, 'application/xml');
+  const opfPath = xml(await read('META-INF/container.xml')).querySelector('rootfile').getAttribute('full-path');
+  const opf = xml(await read(opfPath));
+  const manifest = {};
+  for (const it of opf.getElementsByTagName('item'))
+    manifest[it.getAttribute('id')] = { href: resolve(opfPath, it.getAttribute('href')), props: it.getAttribute('properties') || '' };
+  const spine = [...opf.getElementsByTagName('itemref')].map(r => manifest[r.getAttribute('idref')]).filter(Boolean);
+
+  // table of contents: EPUB3 nav, else EPUB2 NCX
+  const titles = new Map();   // spine file -> chapter title (first TOC entry wins)
+  const addToc = (href, base, label) => {
+    const f = resolve(base, href.split('#')[0]);
+    if (label && !titles.has(f)) titles.set(f, label.replace(/\s+/g, ' ').trim());
+  };
+  const navItem = Object.values(manifest).find(m => m.props.split(' ').includes('nav'));
+  const ncxId = opf.querySelector('spine')?.getAttribute('toc');
+  if (navItem) {
+    const doc = new DOMParser().parseFromString(await read(navItem.href), 'text/html');
+    const nav = [...doc.querySelectorAll('nav')].find(n => n.getAttribute('epub:type') === 'toc') || doc.querySelector('nav');
+    nav?.querySelectorAll('a[href]').forEach(a => addToc(a.getAttribute('href'), navItem.href, a.textContent));
+  } else if (ncxId && manifest[ncxId]) {
+    const ncx = xml(await read(manifest[ncxId].href));
+    for (const pt of ncx.getElementsByTagName('navPoint'))
+      addToc(pt.getElementsByTagName('content')[0].getAttribute('src'), manifest[ncxId].href,
+             pt.getElementsByTagName('text')[0]?.textContent);
+  }
+
+  // a chapter runs from its TOC file up to the next TOC file
+  const chapters = [];
+  for (const item of spine) {
+    const text = htmlToText(await read(item.href));
+    if (titles.has(item.href) || !chapters.length) chapters.push({ title: titles.get(item.href) || 'Start', text });
+    else chapters.at(-1).text += '\n\n' + text;
+  }
+  const usable = chapters.filter(c => c.text);
+  if (!usable.length) throw new Error('No readable text found in this EPUB');
+  const title = opf.getElementsByTagName('dc:title')[0]?.textContent.trim() || file.name.replace(/\.epub$/i, '');
+  return { title, chapters: usable };
+}
+
+function loadChapter(i, play) {
+  chapterIdx = i;
+  run++; synth.cancel(); setState('idle');
+  text = book.chapters[i].text;
+  $('input').hidden = true; $('reader').hidden = false; $('edit').hidden = true;
+  $('chtitle').hidden = false; $('chtitle').textContent = book.chapters[i].title;
+  render();
+  scrollTo(0, 0);
+  for (const b of $('chlist').querySelectorAll('button')) b.removeAttribute('aria-current');
+  const cur = $('chlist').children[i].firstChild;
+  cur.setAttribute('aria-current', 'true');
+  cur.scrollIntoView({ block: 'nearest' });
+  if (play) speakFrom(0);
+}
+
+async function openBook(file) {
+  try {
+    const b = await parseEpub(file);
+    book = b;
+    $('title').textContent = $('btitle').textContent = b.title;
+    $('chlist').innerHTML = '';
+    b.chapters.forEach((c, i) => {
+      const li = document.createElement('li'), btn = document.createElement('button');
+      btn.textContent = c.title;
+      btn.onclick = () => { loadChapter(i, true); if (innerWidth < 700) $('drawer').hidden = true; };
+      li.append(btn); $('chlist').append(li);
+    });
+    $('chapters-btn').hidden = false; $('drawer').hidden = true;
+    // skip covers and title pages: start at the first chapter with real text
+    loadChapter(Math.max(0, b.chapters.findIndex(c => c.text.length > 400)), true);
+  } catch (err) {
+    $('hint').textContent = "Couldn't open that file: " + err.message;
+  }
+}
+
+function closeBook() {
+  run++; synth.cancel(); setState('idle');
+  book = null; text = '';
+  $('title').textContent = 'Speakit';
+  $('drawer').hidden = true; $('chapters-btn').hidden = true; $('chtitle').hidden = true;
+  $('reader').hidden = true; $('input').hidden = false;
+}
+
+$('open').onclick = () => $('file').click();
+$('file').onchange = e => { const f = e.target.files[0]; e.target.value = ''; if (f) openBook(f); };
+$('chapters-btn').onclick = () => { $('drawer').hidden = !$('drawer').hidden; };
+$('closebook').onclick = closeBook;
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault();
+  const f = [...e.dataTransfer.files].find(f => /\.epub$/i.test(f.name));
+  if (f) openBook(f);
+});
+
 $('play').onclick = toggle;
 $('reader').onclick = e => {
   const el = e.target.closest('.w'); if (!el) return;
   speakFrom(words.find(w => w.el === el).start);
 };
 $('edit').onclick = () => {
+  if (book) return;
   run++; synth.cancel(); setState('idle');
   $('reader').hidden = true; $('edit').hidden = true; $('input').hidden = false; $('input').focus();
 };
