@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Speakit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400;0,7..72,600;1,7..72,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #F2F3F8; --ink: #1B1E2B; --dim: #1B1E2B73; --line: #1B1E2B1f;
+    --hl: #4338CA; --hl-ink: #fff; --dock: #fff; --field: #fff;
+    --serif: "Literata", Georgia, "Times New Roman", serif;
+    --sans: -apple-system, system-ui, "Segoe UI", sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12131A; --ink: #E7E8EF; --dim: #E7E8EF66; --line: #E7E8EF26;
+            --hl: #A5A8FF; --hl-ink: #12131A; --dock: #1C1E29; --field: #1C1E29; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); padding-bottom: 9rem; }
+  :focus-visible { outline: 2px solid var(--hl); outline-offset: 2px; }
+
+  header { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+           max-width: 38rem; margin: 0 auto; padding: 1.25rem 1.25rem 0; }
+  header h1 { font: 600 1.05rem var(--sans); margin: 0; letter-spacing: -.01em; }
+  select { font: inherit; font-size: .9rem; color: var(--ink); background: var(--field);
+           border: 1px solid var(--line); border-radius: 8px; padding: .4rem .6rem; max-width: 13rem; }
+
+  main { max-width: 38rem; margin: 0 auto; padding: 2rem 1.25rem; }
+  textarea { width: 100%; min-height: 60vh; resize: vertical; font: 400 1.25rem/1.75 var(--serif);
+             color: var(--ink); background: var(--field); border: 1px solid var(--line);
+             border-radius: 12px; padding: 1.25rem; }
+  textarea::placeholder { color: var(--dim); }
+
+  #reader { position: relative; white-space: pre-wrap; font: 400 1.3rem/1.85 var(--serif); }
+  #reader .w { position: relative; z-index: 1; cursor: pointer; transition: color .25s; scroll-margin: 40vh 0; }
+  #reader .w.read { color: var(--dim); }
+  #reader .w:hover { text-decoration: underline; text-decoration-color: var(--dim); text-underline-offset: 4px; }
+  #reader .w.on { color: var(--hl-ink); }
+  #pill { position: absolute; z-index: 0; left: 0; top: 0; background: var(--hl); border-radius: 6px;
+          pointer-events: none; opacity: 0;
+          transition: transform .14s ease-out, width .14s ease-out, opacity .2s; }
+  #pill.jump { transition: opacity .2s; }
+
+  #dock { position: fixed; left: 50%; bottom: 1.25rem; transform: translateX(-50%);
+          display: flex; align-items: center; gap: .75rem; padding: .5rem .6rem;
+          background: var(--dock); border: 1px solid var(--line); border-radius: 999px;
+          box-shadow: 0 8px 28px #0000001f; max-width: calc(100vw - 1.5rem); }
+  #play { width: 3rem; height: 3rem; border-radius: 50%; border: 0; background: var(--hl); color: var(--hl-ink);
+          font-size: 1.1rem; cursor: pointer; flex: none; }
+  #play:active { transform: scale(.94); }
+  .speeds { display: flex; gap: .15rem; }
+  .speeds button { border: 0; background: none; color: var(--dim); font: 500 .85rem var(--sans);
+                   padding: .45rem .55rem; border-radius: 999px; cursor: pointer; }
+  .speeds button[aria-pressed="true"] { color: var(--ink); background: var(--line); }
+  #edit { border: 0; background: none; color: var(--ink); font: 500 .85rem var(--sans); padding: .45rem .7rem;
+          border-radius: 999px; cursor: pointer; border-left: 1px solid var(--line); border-radius: 0 999px 999px 0; }
+  #hint { max-width: 38rem; margin: 0 auto; padding: 0 1.25rem; font-size: .85rem; color: var(--dim); }
+  @media (max-width: 30rem) { .speeds button { padding: .45rem .35rem; } #edit { padding: .45rem .4rem; } }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Speakit</h1>
+  <select id="voice" aria-label="Voice"></select>
+</header>
+<div id="hint"></div>
+<main>
+  <textarea id="input" placeholder="Paste or type text to read aloud">Paste any text here and press play. Each word lights up as it is spoken. Click any word to start reading from there, and change the speed while it plays.</textarea>
+  <div id="reader" hidden><div id="pill"></div></div>
+</main>
+
+<div id="dock">
+  <button id="play" aria-label="Play">▶</button>
+  <div class="speeds" id="speeds" role="group" aria-label="Speed"></div>
+  <button id="edit" hidden>Edit text</button>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const synth = window.speechSynthesis;
+const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
+
+let text = '';
+let words = [];        // [{start, end, el}]
+let current = -1;
+let run = 0;           // ignores events from a cancelled run
+let state = 'idle';    // idle | playing | paused
+let rate = 1;
+
+// ---- voices: Premium/Enhanced first ----
+const rank = v => /premium/i.test(v.name) ? 0 : /enhanced/i.test(v.name) ? 1 : 2;
+function loadVoices() {
+  const keep = $('voice').value;
+  const vs = synth.getVoices().filter(v => v.localService && /^en/i.test(v.lang))
+    .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+  $('voice').innerHTML = vs.map(v => `<option value="${v.voiceURI}">${v.name}</option>`).join('');
+  if (keep) $('voice').value = keep;
+  $('hint').textContent = vs.some(v => rank(v) < 2) ? '' :
+    'For a natural voice, download a Premium one: System Settings → Accessibility → Read & Speak → System voice → Manage Voices.';
+}
+loadVoices();
+synth.onvoiceschanged = loadVoices;
+$('voice').onchange = () => { if (state !== 'idle') speakFrom(words[current]?.start ?? 0); };
+
+// ---- speed ----
+$('speeds').innerHTML = SPEEDS.map(s => `<button data-s="${s}" aria-pressed="${s === rate}">${s}×</button>`).join('');
+$('speeds').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  rate = +b.dataset.s;
+  for (const x of $('speeds').children) x.setAttribute('aria-pressed', x === b);
+  if (state === 'playing') speakFrom(words[current]?.start ?? 0);
+  else if (state === 'paused') pendingRestart = true;   // applies on resume
+};
+let pendingRestart = false;
+
+// ---- reader rendering ----
+function render() {
+  const reader = $('reader');
+  reader.querySelectorAll('.w, .gap').forEach(n => n.remove());
+  words = []; current = -1;
+  for (const m of text.matchAll(/(\S+)|(\s+)/g)) {
+    if (m[1]) {
+      const el = document.createElement('span');
+      el.className = 'w'; el.textContent = m[1];
+      reader.append(el);
+      words.push({ start: m.index, end: m.index + m[1].length, el });
+    } else reader.append(document.createTextNode(m[2]));
+  }
+}
+
+function wordAt(charIndex) {
+  let lo = 0, hi = words.length - 1;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; words[mid].start <= charIndex ? lo = mid : hi = mid - 1; }
+  return lo;
+}
+
+function setCurrent(i) {
+  if (i === current) return;
+  if (i > current) for (let k = Math.max(current, 0); k < i; k++) words[k].el.classList.add('read');
+  else for (let k = i; k <= current; k++) words[k].el.classList.remove('read');
+  words[current]?.el.classList.remove('on');
+  words[i].el.classList.add('on');
+  current = i;
+  movePill(true);
+  const r = words[i].el.getBoundingClientRect();
+  if (r.top < 80 || r.bottom > innerHeight - 140) words[i].el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+function movePill(animate) {
+  const el = words[current]?.el, pill = $('pill');
+  if (!el) { pill.style.opacity = 0; return; }
+  const sameLine = Math.abs(el.offsetTop - (+pill.dataset.y || 0)) < 4;
+  pill.classList.toggle('jump', !animate || !sameLine);
+  pill.dataset.y = el.offsetTop;
+  pill.style.width = el.offsetWidth + 8 + 'px';
+  pill.style.height = el.offsetHeight + 'px';
+  pill.style.transform = `translate(${el.offsetLeft - 4}px, ${el.offsetTop}px)`;
+  pill.style.opacity = 1;
+}
+addEventListener('resize', () => movePill(false));
+
+// ---- speech ----
+function speakFrom(offset) {
+  synth.cancel();
+  const id = ++run;
+  pendingRestart = false;
+  setCurrent(wordAt(offset));
+  const voice = synth.getVoices().find(v => v.voiceURI === $('voice').value);
+  // one utterance per sentence: long utterances get cut off in Chrome
+  const chunks = [...text.slice(offset).matchAll(/[^.!?\n]+[.!?]*\s*/g)];
+  chunks.forEach((m, k) => {
+    const u = new SpeechSynthesisUtterance(m[0]);
+    if (voice) { u.voice = voice; u.lang = voice.lang; }
+    u.rate = rate;
+    u.onboundary = e => { if (id === run && e.name === 'word') setCurrent(wordAt(offset + m.index + e.charIndex)); };
+    if (k === chunks.length - 1) u.onend = u.onerror = () => { if (id === run) finish(); };
+    synth.speak(u);
+  });
+  setState('playing');
+}
+
+function finish() {
+  words[current]?.el.classList.remove('on');
+  $('pill').style.opacity = 0;
+  for (const w of words) w.el.classList.remove('read');
+  current = -1;
+  setState('idle');
+}
+
+function setState(s) {
+  state = s;
+  $('play').textContent = s === 'playing' ? '⏸' : '▶';
+  $('play').setAttribute('aria-label', s === 'playing' ? 'Pause' : 'Play');
+}
+
+function toggle() {
+  if ($('reader').hidden) {                       // first play: switch to reading view
+    text = $('input').value;
+    if (!text.trim()) return $('input').focus();
+    $('input').hidden = true; $('reader').hidden = false; $('edit').hidden = false;
+    render();
+    return speakFrom(0);
+  }
+  if (state === 'playing') { synth.pause(); setState('paused'); }
+  else if (state === 'paused') {
+    if (pendingRestart) speakFrom(words[current]?.start ?? 0);
+    else { synth.resume(); setState('playing'); }
+  } else speakFrom(0);
+}
+
+$('play').onclick = toggle;
+$('reader').onclick = e => {
+  const el = e.target.closest('.w'); if (!el) return;
+  speakFrom(words.find(w => w.el === el).start);
+};
+$('edit').onclick = () => {
+  run++; synth.cancel(); setState('idle');
+  $('reader').hidden = true; $('edit').hidden = true; $('input').hidden = false; $('input').focus();
+};
+addEventListener('keydown', e => {
+  if (e.code === 'Space' && !/^(TEXTAREA|SELECT|BUTTON)$/.test(e.target.tagName)) { e.preventDefault(); toggle(); }
+});
+</script>
+</body>
+</html>
