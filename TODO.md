@@ -4,7 +4,7 @@
 
 Tested `kokoro-js@1.2.1` + `onnx-community/Kokoro-82M-v1.0-ONNX` in Chrome on this Mac (probe pages were throwaway).
 
-- Loads and speaks fully in the page, no server.
+- Loads and generates audio fully in the page, no server (generated and timed it; didn't listen to it).
 - Speed, warm: WebGPU fp32 about 0.24x real time (4x faster than playback; 325 MB model, ~25 s first load).
   WASM q8 (92 MB) about 1.5-1.7x real time, too slow to stream (test server had no COOP/COEP headers, so single-threaded; not retried).
 - **No word timings:** the ONNX export outputs only `waveform`, not per-token durations. Other published exports have the same graph.
