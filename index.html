@@ -72,6 +72,15 @@
   #chlist button:hover { background: var(--line); }
   #chlist button[aria-current="true"] { background: var(--line); font-weight: 600; }
   #dock { z-index: 10; }
+  #library { margin-bottom: 1.5rem; }
+  #library ul { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; }
+  #library li { display: flex; align-items: stretch; gap: .4rem; }
+  #library .item { flex: 1; min-width: 0; text-align: left; border: 1px solid var(--line); background: var(--field);
+                   color: var(--ink); border-radius: 10px; padding: .6rem .8rem; cursor: pointer; font: inherit; }
+  #library .item b { display: block; font: 600 .95rem var(--sans); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #library .item span { font-size: .8rem; color: var(--dim); }
+  #library .rm { border: 1px solid var(--line); background: var(--field); color: var(--dim); border-radius: 10px;
+                 padding: 0 .8rem; cursor: pointer; font-size: 1.1rem; }
   #hint { max-width: 38rem; margin: 0 auto; padding: 0 1.25rem; font-size: .85rem; color: var(--dim); }
   @media (max-width: 30rem) { .speeds button { padding: .45rem .35rem; } .dockbtn { padding: .45rem .4rem; } }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
@@ -88,6 +97,7 @@
 </header>
 <div id="hint"></div>
 <main>
+  <section id="library" hidden aria-label="Your books"><ul id="books"></ul></section>
   <textarea id="input" placeholder="Paste or type text to read aloud">Paste any text here and press play. Each word lights up as it is spoken. Click any word to start reading from there, and change the speed while it plays.</textarea>
   <h2 id="chtitle" hidden></h2>
   <div id="reader" hidden><div id="pill"></div></div>
@@ -172,6 +182,7 @@ function setCurrent(i) {
   words[current]?.el.classList.remove('on');
   words[i].el.classList.add('on');
   current = i;
+  if (book) saveSoon();
   movePill(true);
   const r = words[i].el.getBoundingClientRect();
   if (r.top < 80 || r.bottom > innerHeight - 140) words[i].el.scrollIntoView({ block: 'center', behavior: 'smooth' });
@@ -232,7 +243,7 @@ function toggle() {
   if ($('reader').hidden) {                       // first play: switch to reading view
     text = $('input').value;
     if (!text.trim()) return $('input').focus();
-    $('input').hidden = true; $('reader').hidden = false; $('edit').hidden = false;
+    $('input').hidden = true; $('library').hidden = true; $('reader').hidden = false; $('edit').hidden = false;
     render();
     return speakFrom(0);
   }
@@ -242,6 +253,48 @@ function toggle() {
     else { synth.resume(); setState('playing'); }
   } else speakFrom(0);
 }
+
+// ---- library: books and reading position saved in IndexedDB ----
+const idb = new Promise((res, rej) => {
+  const r = indexedDB.open('speakit', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('books', { keyPath: 'id' });
+  r.onsuccess = () => res(r.result);
+  r.onerror = () => rej(r.error);
+});
+const store = (mode, fn) => idb.then(db => new Promise((res, rej) => {
+  const t = db.transaction('books', mode), rq = fn(t.objectStore('books'));
+  t.oncomplete = () => res(rq?.result);
+  t.onerror = () => rej(t.error);
+}));
+const bookId = f => f.name + '|' + f.size;
+
+let saveTimer;
+function saveSoon() { clearTimeout(saveTimer); saveTimer = setTimeout(saveProgress, 1500); }
+function saveProgress() {
+  if (!book) return;
+  const patch = { chapter: chapterIdx, offset: words[current]?.start ?? 0,
+                  chapterTitle: book.chapters[chapterIdx].title, updated: Date.now() };
+  store('readwrite', s => { const g = s.get(book.id); g.onsuccess = () => g.result && s.put({ ...g.result, ...patch }); }).catch(() => {});
+}
+addEventListener('visibilitychange', () => { if (document.hidden) saveProgress(); });
+
+async function renderLibrary() {
+  const items = ((await store('readonly', s => s.getAll()).catch(() => [])) || []).sort((a, b) => b.updated - a.updated);
+  $('library').hidden = !items.length || !!book || $('input').hidden;
+  $('books').innerHTML = '';
+  for (const it of items) {
+    const li = document.createElement('li'), open = document.createElement('button'), rm = document.createElement('button');
+    open.className = 'item';
+    open.innerHTML = '<b></b><span></span>';
+    open.firstChild.textContent = it.title;
+    open.lastChild.textContent = it.chapterTitle ? 'Continue: ' + it.chapterTitle : 'Not started';
+    open.onclick = () => openBook(it.blob);
+    rm.className = 'rm'; rm.textContent = '×'; rm.setAttribute('aria-label', 'Remove ' + it.title);
+    rm.onclick = async () => { await store('readwrite', s => s.delete(it.id)).catch(() => {}); renderLibrary(); };
+    li.append(open, rm); $('books').append(li);
+  }
+}
+renderLibrary();
 
 // ---- EPUB ----
 let book = null;       // {title, chapters: [{title, text}]}
@@ -338,11 +391,11 @@ async function parseEpub(file) {
   return { title, chapters: usable };
 }
 
-function loadChapter(i, play) {
+function loadChapter(i, play, offset = 0) {
   chapterIdx = i;
   run++; synth.cancel(); setState('idle');
   text = book.chapters[i].text;
-  $('input').hidden = true; $('reader').hidden = false; $('edit').hidden = true;
+  $('input').hidden = true; $('library').hidden = true; $('reader').hidden = false; $('edit').hidden = true;
   $('chtitle').hidden = false; $('chtitle').textContent = book.chapters[i].title;
   render();
   scrollTo(0, 0);
@@ -350,12 +403,19 @@ function loadChapter(i, play) {
   const cur = $('chlist').children[i].firstChild;
   cur.setAttribute('aria-current', 'true');
   cur.scrollIntoView({ block: 'nearest' });
-  if (play) speakFrom(0);
+  if (play) speakFrom(offset);
+  else saveSoon();
 }
 
 async function openBook(file) {
   try {
     const b = await parseEpub(file);
+    b.id = bookId(file);
+    const saved = await store('readonly', s => s.get(b.id)).catch(() => null);
+    if (!saved) {
+      store('readwrite', s => s.put({ id: b.id, title: b.title, blob: file, chapter: 0, offset: 0, updated: Date.now() })).catch(() => {});
+      navigator.storage?.persist?.();
+    }
     book = b;
     $('title').textContent = $('btitle').textContent = b.title;
     $('chlist').innerHTML = '';
@@ -367,18 +427,22 @@ async function openBook(file) {
     });
     $('chapters-btn').hidden = false; $('drawer').hidden = true;
     // skip covers and title pages: start at the first chapter with real text
-    loadChapter(Math.max(0, b.chapters.findIndex(c => c.text.length > 400)), true);
+    const first = Math.max(0, b.chapters.findIndex(c => c.text.length > 400));
+    if (saved && saved.chapter < b.chapters.length) loadChapter(saved.chapter, true, saved.offset);
+    else loadChapter(first, true);
   } catch (err) {
     $('hint').textContent = "Couldn't open that file: " + err.message;
   }
 }
 
 function closeBook() {
+  saveProgress();
   run++; synth.cancel(); setState('idle');
   book = null; text = '';
   $('title').textContent = 'Speakit';
   $('drawer').hidden = true; $('chapters-btn').hidden = true; $('chtitle').hidden = true;
   $('reader').hidden = true; $('input').hidden = false;
+  renderLibrary();
 }
 
 $('open').onclick = () => $('file').click();
@@ -401,6 +465,7 @@ $('edit').onclick = () => {
   if (book) return;
   run++; synth.cancel(); setState('idle');
   $('reader').hidden = true; $('edit').hidden = true; $('input').hidden = false; $('input').focus();
+  renderLibrary();
 };
 addEventListener('keydown', e => {
   if (e.code === 'Space' && !/^(TEXTAREA|SELECT|BUTTON)$/.test(e.target.tagName)) { e.preventDefault(); toggle(); }
